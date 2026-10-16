@@ -1,0 +1,7 @@
+{
+  "PUBLIC_URL": "https://whatsapp.example.com",
+  "DATA_DIR": "/home/YOUR_USER/apps/baileys-dot/shared",
+  "ADMIN_TOKEN_FILE": "/home/YOUR_USER/apps/baileys-dot/shared/admin.token",
+  "PORT": "4391",
+  "LOG_LEVEL": "info"
+}
