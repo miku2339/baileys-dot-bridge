@@ -250,6 +250,36 @@ function extractContent(rawMessage) {
   }
 }
 
+function quotedIncomingMessage(source) {
+  const media = source.media && typeof source.media === 'object' ? source.media : {}
+  const metadata = {
+    ...(typeof media.mimetype === 'string' ? { mimetype: media.mimetype } : {}),
+    ...(typeof source.text === 'string' ? { caption: source.text } : {})
+  }
+  let message
+  if (source.mediaType === 'image') message = { imageMessage: metadata }
+  else if (source.mediaType === 'video') message = { videoMessage: metadata }
+  else if (source.mediaType === 'document') {
+    message = {
+      documentMessage: {
+        ...metadata,
+        ...(typeof media.fileName === 'string' ? { fileName: media.fileName } : {})
+      }
+    }
+  } else {
+    message = { conversation: typeof source.text === 'string' ? source.text : '' }
+  }
+  return {
+    key: {
+      remoteJid: source.chatId,
+      id: source.id,
+      fromMe: false,
+      ...(GROUP_JID.test(source.chatId) ? { participant: source.senderId } : {})
+    },
+    message
+  }
+}
+
 function safeError(error) {
   return {
     name: typeof error?.name === 'string' ? error.name : 'Error',
@@ -980,9 +1010,10 @@ export class WhatsAppBridge extends EventEmitter {
       throw new Error('idempotencyKey was already used with a different request')
     }
     const isAutomaticReply = idempotencyKey.startsWith('dot-auto:')
-    if (isAutomaticReply) await this._validateAutomaticReply(chatId, idempotencyKey, false)
+    let source
+    if (isAutomaticReply) source = await this._validateAutomaticReply(chatId, idempotencyKey, false)
     if (entry?.status === 'sent') return entry.messageId
-    if (isAutomaticReply) await this._validateAutomaticReply(chatId, idempotencyKey, true)
+    if (isAutomaticReply) source = await this._validateAutomaticReply(chatId, idempotencyKey, true)
 
     if (!entry) {
       entry = {
@@ -999,7 +1030,10 @@ export class WhatsAppBridge extends EventEmitter {
       })
     }
 
-    const sent = await this.socket.sendMessage(chatId, { text }, { messageId: entry.messageId })
+    const sent = await this.socket.sendMessage(chatId, { text }, {
+      messageId: entry.messageId,
+      ...(source ? { quoted: quotedIncomingMessage(source) } : {})
+    })
     await this._mutateStore(() => {
       entry.messageId = sent?.key?.id || entry.messageId
       entry.status = 'sent'
@@ -1012,7 +1046,8 @@ export class WhatsAppBridge extends EventEmitter {
         timestamp: entry.sentAt,
         text,
         mediaType: null,
-        media: null
+        media: null,
+        ...(source ? { _replyTo: { id: source.id, participant: source.senderId } } : {})
       }, null)
     })
     return entry.messageId
@@ -1036,9 +1071,10 @@ export class WhatsAppBridge extends EventEmitter {
       throw new Error('idempotencyKey was already used with a different request')
     }
     const isAutomaticReply = idempotencyKey.startsWith('dot-auto:')
-    if (isAutomaticReply) await this._validateAutomaticReply(chatId, idempotencyKey, false)
+    let source
+    if (isAutomaticReply) source = await this._validateAutomaticReply(chatId, idempotencyKey, false)
     if (entry?.status === 'sent') return entry.messageId
-    if (isAutomaticReply) await this._validateAutomaticReply(chatId, idempotencyKey, true)
+    if (isAutomaticReply) source = await this._validateAutomaticReply(chatId, idempotencyKey, true)
 
     if (!entry) {
       entry = {
@@ -1058,7 +1094,10 @@ export class WhatsAppBridge extends EventEmitter {
       })
     }
 
-    const sent = await this.socket.sendMessage(chatId, { image, mimetype, caption }, { messageId: entry.messageId })
+    const sent = await this.socket.sendMessage(chatId, { image, mimetype, caption }, {
+      messageId: entry.messageId,
+      ...(source ? { quoted: quotedIncomingMessage(source) } : {})
+    })
     await this._mutateStore(() => {
       entry.messageId = sent?.key?.id || entry.messageId
       entry.status = 'sent'
@@ -1071,7 +1110,8 @@ export class WhatsAppBridge extends EventEmitter {
         timestamp: entry.sentAt,
         text: caption || null,
         mediaType: 'image',
-        media: { mimetype, size: image.length }
+        media: { mimetype, size: image.length },
+        ...(source ? { _replyTo: { id: source.id, participant: source.senderId } } : {})
       }, null)
     })
     return entry.messageId
@@ -1091,9 +1131,10 @@ export class WhatsAppBridge extends EventEmitter {
       throw new Error('idempotencyKey was already used with a different request')
     }
     const isAutomaticReply = idempotencyKey.startsWith('dot-auto:')
-    if (isAutomaticReply) await this._validateAutomaticReply(chatId, idempotencyKey, false)
+    let source
+    if (isAutomaticReply) source = await this._validateAutomaticReply(chatId, idempotencyKey, false)
     if (entry?.status === 'sent') return entry.messageId
-    if (isAutomaticReply) await this._validateAutomaticReply(chatId, idempotencyKey, true)
+    if (isAutomaticReply) source = await this._validateAutomaticReply(chatId, idempotencyKey, true)
 
     if (!entry) {
       entry = {
@@ -1118,7 +1159,10 @@ export class WhatsAppBridge extends EventEmitter {
     const content = kind === 'video'
       ? { video: media, mimetype, caption, ...(seconds === null ? {} : { seconds }) }
       : { document: media, mimetype, fileName, caption }
-    const sent = await this.socket.sendMessage(chatId, content, { messageId: entry.messageId })
+    const sent = await this.socket.sendMessage(chatId, content, {
+      messageId: entry.messageId,
+      ...(source ? { quoted: quotedIncomingMessage(source) } : {})
+    })
     await this._mutateStore(() => {
       entry.messageId = sent?.key?.id || entry.messageId
       entry.status = 'sent'
@@ -1131,7 +1175,8 @@ export class WhatsAppBridge extends EventEmitter {
         timestamp: entry.sentAt,
         text: caption || null,
         mediaType: kind,
-        media: { mimetype, fileName, size: media.length }
+        media: { mimetype, fileName, size: media.length },
+        ...(source ? { _replyTo: { id: source.id, participant: source.senderId } } : {})
       }, null)
     })
     return entry.messageId
@@ -1297,7 +1342,7 @@ export class WhatsAppBridge extends EventEmitter {
       if (senderRoleForMessage(source, this.ownerIdentities.ownerIds) !== 'owner') {
         throw new Error('dot-auto source is not an owner direct message')
       }
-      return
+      return source
     }
 
     this._refreshBotIdentitySeeds()
@@ -1309,6 +1354,7 @@ export class WhatsAppBridge extends EventEmitter {
     if (requireFreshGroup && !(await this._getGroupAccess(chatId, { fresh: true }))) {
       throw new Error('dot-auto group is not currently allowed')
     }
+    return source
   }
 
   async _loadDependencies() {

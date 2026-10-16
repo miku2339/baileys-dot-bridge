@@ -1516,6 +1516,186 @@ test('verifies replies to known bot messages and applies image automatic-reply g
   await harness.bridge.stop()
 })
 
+test('quotes the verified incoming text or media for every automatic reply type', async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'baileys-auto-quotes-'))
+  t.after(() => rm(dataDir, { recursive: true, force: true }))
+  const ownerId = '111111111111111@lid'
+  const botId = '222222222222222@lid'
+  const senderId = '333333333333333@lid'
+  const botPn = '85255551234@s.whatsapp.net'
+  const groupId = '120363123456789012@g.us'
+  const otherGroupId = '120363987654321000@g.us'
+  await writeFile(join(dataDir, 'owner-identities.json'), JSON.stringify({
+    version: 1,
+    ownerIds: [ownerId],
+    allowOwnerGroups: true
+  }), { mode: 0o600 })
+  const options = {
+    socketUser: { id: botPn, lid: botId, name: 'Dot' },
+    groupMetadata: async (chatId) => ({
+      id: chatId,
+      participants: [{ id: ownerId }, { id: botPn, lid: botId }]
+    })
+  }
+  const first = createHarness(dataDir, options)
+  const received = []
+  first.bridge.on('message', (message) => received.push(message))
+  await first.bridge.start()
+  first.sockets[0].ev.emit('connection.update', { connection: 'open' })
+  const earlierBotMessageId = await first.bridge.sendText({
+    chatId: groupId,
+    text: 'earlier bot message',
+    idempotencyKey: 'manual:earlier-bot-message'
+  })
+  const now = Math.floor(Date.now() / 1000)
+  first.sockets[0].ev.emit('messages.upsert', {
+    type: 'notify',
+    messages: [
+      {
+        key: { id: 'private-text', remoteJid: ownerId, fromMe: false },
+        messageTimestamp: now,
+        message: { conversation: 'private text' }
+      },
+      {
+        key: { id: 'private-image', remoteJid: ownerId, fromMe: false },
+        messageTimestamp: now + 1,
+        message: { imageMessage: { mimetype: 'image/jpeg', fileName: 'photo.jpg', caption: 'private image' } }
+      },
+      {
+        key: { id: 'group-video', remoteJid: groupId, participant: senderId, fromMe: false },
+        messageTimestamp: now + 2,
+        message: {
+          videoMessage: {
+            mimetype: 'video/mp4',
+            caption: 'group video',
+            contextInfo: { mentionedJid: [botId] }
+          }
+        }
+      },
+      {
+        key: { id: 'group-document', remoteJid: groupId, participant: senderId, fromMe: false },
+        messageTimestamp: now + 3,
+        message: {
+          documentMessage: {
+            mimetype: 'text/plain',
+            fileName: 'notes.txt',
+            caption: 'group document',
+            contextInfo: {
+              stanzaId: earlierBotMessageId,
+              participant: botId,
+              quotedMessage: {
+                extendedTextMessage: {
+                  text: 'earlier bot message',
+                  contextInfo: { stanzaId: 'older-message', participant: senderId }
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  })
+  await waitFor(() => received.length === 4)
+
+  await assert.rejects(first.bridge.sendText({
+    chatId: otherGroupId,
+    text: 'forged cross-chat reply',
+    idempotencyKey: 'dot-auto:private-text'
+  }), /does not reference an incoming message in this chat/)
+  assert.equal(first.sendCalls, 1)
+
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlVQAAAAASUVORK5CYII='
+  const video = Buffer.from([0x00, 0x00, 0x00, 0x10, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d])
+  const requests = [
+    ['private-text', () => first.bridge.sendText({
+      chatId: ownerId,
+      text: 'text reply',
+      idempotencyKey: 'dot-auto:private-text'
+    })],
+    ['private-image', () => first.bridge.sendImage({
+      chatId: ownerId,
+      imageBase64: png,
+      caption: 'image reply',
+      idempotencyKey: 'dot-auto:private-image'
+    })],
+    ['group-video', () => first.bridge.sendMedia({
+      chatId: groupId,
+      kind: 'video',
+      data: video,
+      mimetype: 'video/mp4',
+      fileName: 'reply.mp4',
+      caption: 'video reply',
+      idempotencyKey: 'dot-auto:group-video'
+    })],
+    ['group-document', () => first.bridge.sendMedia({
+      chatId: groupId,
+      kind: 'document',
+      data: Buffer.from('reply document'),
+      mimetype: 'text/plain',
+      fileName: 'reply.txt',
+      caption: 'document reply',
+      idempotencyKey: 'dot-auto:group-document'
+    })]
+  ]
+  const messageIds = []
+  for (const [, send] of requests) messageIds.push(await send())
+
+  assert.deepEqual(first.sentMessages.slice(1).map(({ options: sendOptions }) => sendOptions.quoted), [
+    {
+      key: { remoteJid: ownerId, id: 'private-text', fromMe: false },
+      message: { conversation: 'private text' }
+    },
+    {
+      key: { remoteJid: ownerId, id: 'private-image', fromMe: false },
+      message: { imageMessage: { mimetype: 'image/jpeg', caption: 'private image' } }
+    },
+    {
+      key: { remoteJid: groupId, id: 'group-video', fromMe: false, participant: senderId },
+      message: { videoMessage: { mimetype: 'video/mp4', caption: 'group video' } }
+    },
+    {
+      key: { remoteJid: groupId, id: 'group-document', fromMe: false, participant: senderId },
+      message: { documentMessage: { mimetype: 'text/plain', caption: 'group document', fileName: 'notes.txt' } }
+    }
+  ])
+  for (const [index, [sourceId]] of requests.entries()) {
+    assert.equal(first.sentMessages[index + 1].options.messageId, messageIds[index])
+    assert.equal(first.bridge.getMessages({
+      chatId: index < 2 ? ownerId : groupId
+    }).find((message) => message.id === messageIds[index]).quotedMessageId, sourceId)
+  }
+  await first.bridge.stop()
+
+  const second = createHarness(dataDir, options)
+  await second.bridge.start()
+  second.sockets[0].ev.emit('connection.update', { connection: 'open' })
+  const restartedRequests = [
+    () => second.bridge.sendText({ chatId: ownerId, text: 'text reply', idempotencyKey: 'dot-auto:private-text' }),
+    () => second.bridge.sendImage({ chatId: ownerId, imageBase64: png, caption: 'image reply', idempotencyKey: 'dot-auto:private-image' }),
+    () => second.bridge.sendMedia({
+      chatId: groupId,
+      kind: 'video',
+      data: video,
+      mimetype: 'video/mp4',
+      fileName: 'reply.mp4',
+      caption: 'video reply',
+      idempotencyKey: 'dot-auto:group-video'
+    }),
+    () => second.bridge.sendMedia({
+      chatId: groupId,
+      kind: 'document',
+      data: Buffer.from('reply document'),
+      mimetype: 'text/plain',
+      fileName: 'reply.txt',
+      caption: 'document reply',
+      idempotencyKey: 'dot-auto:group-document'
+    })
+  ]
+  for (const [index, send] of restartedRequests.entries()) assert.equal(await send(), messageIds[index])
+  assert.equal(second.sendCalls, 0)
+  await second.bridge.stop()
+})
+
 test('enforces mention-only group writes, mention-all silence, and bounded group info', async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), 'baileys-mention-only-group-'))
   t.after(() => rm(dataDir, { recursive: true, force: true }))
