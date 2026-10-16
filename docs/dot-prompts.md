@@ -1,5 +1,7 @@
 # 在原生 Dot 建立 WhatsApp 自動回覆規則
 
+[English](dot-prompts.en.md) | [繁體中文](dot-prompts.md) | [日本語](dot-prompts.ja.md)
+
 這份設定會建立兩條獨立規則：一條只處理已驗證 owner 私聊；另一條只處理 owner 與 Bot 都在群內、而且有人真正提及或可信引用 Bot 訊息的群組訊息。你需要有權限在原生 Dot 手動建立及啟用規則。
 
 ## 先替換五個值
