@@ -74,7 +74,7 @@ export class EventSubscriptions {
       events: [
         {
           name: EVENT_NAME,
-          description: "A new incoming WhatsApp message in a selected chat or a trusted owner group mention.",
+          description: "A new incoming WhatsApp text or media message in a selected chat, or a trusted owner group message approved for reply by the bridge.",
           delivery: ["webhook"],
           inputSchema: {
             type: "object",
@@ -92,7 +92,7 @@ export class EventSubscriptions {
               },
               ownerGroups: {
                 type: "boolean",
-                description: "Monitor trusted owner groups only when the bot is explicitly mentioned.",
+                description: "Monitor trusted owner groups only when the bridge marks the message replyAllowed=true.",
               },
             },
             anyOf: [
@@ -107,16 +107,34 @@ export class EventSubscriptions {
               id: { type: "string" },
               chatId: { type: "string" },
               senderId: { type: "string" },
-              text: { type: "string" },
+              text: { type: ["string", "null"] },
               timestamp: { type: "string", format: "date-time" },
               fromMe: { type: "boolean" },
               type: { type: "string" },
               senderRole: { type: "string", enum: ["owner", "untrusted"] },
               groupAllowed: { type: "boolean" },
               mentionsBot: { type: "boolean" },
+              repliesToBot: { type: "boolean" },
+              mentionsAll: { type: "boolean" },
+              replyAllowed: { type: "boolean" },
+              mediaType: { type: ["string", "null"] },
+              media: {
+                anyOf: [
+                  {
+                    type: "object",
+                    properties: {
+                      mimetype: { type: ["string", "null"] },
+                      fileName: { type: ["string", "null"] },
+                    },
+                    required: ["mimetype", "fileName"],
+                    additionalProperties: false,
+                  },
+                  { type: "null" },
+                ],
+              },
               pushName: { type: "string" },
             },
-            required: ["id", "chatId", "senderId", "text", "timestamp", "fromMe", "type", "senderRole", "groupAllowed", "mentionsBot"],
+            required: ["id", "chatId", "senderId", "text", "timestamp", "fromMe", "type", "senderRole", "groupAllowed", "mentionsBot", "repliesToBot", "mentionsAll", "replyAllowed", "mediaType", "media"],
             additionalProperties: false,
           },
         },
@@ -601,33 +619,44 @@ function normalizeMessage(value) {
   if (value.senderId !== null && typeof value.senderId !== "string") throw invalidParams("Invalid message senderId");
   if (value.text !== null && typeof value.text !== "string") throw invalidParams("Invalid message text");
   const timestamp = normalizeTimestamp(value.timestamp);
+  const mediaType = typeof value.mediaType === "string" && value.mediaType.length <= 32 ? value.mediaType : null;
+  let media = null;
+  if (mediaType && value.media && typeof value.media === "object" && !Array.isArray(value.media)) {
+    const mimetype = typeof value.media.mimetype === "string" && value.media.mimetype.length <= 512 ? value.media.mimetype : null;
+    const fileName = typeof value.media.fileName === "string" && value.media.fileName.length <= 1024 ? value.media.fileName : null;
+    media = { mimetype, fileName };
+  }
   const message = {
     id: value.id,
     chatId: value.chatId,
     senderId: value.senderId ?? value.chatId,
-    text: value.text ?? "",
+    text: value.text ?? null,
     timestamp,
     fromMe: false,
     type,
     senderRole: value.senderRole === "owner" && isOwnerDirectMessage(value) ? "owner" : "untrusted",
     groupAllowed: value.groupAllowed === true,
     mentionsBot: value.mentionsBot === true,
+    repliesToBot: value.repliesToBot === true,
+    mentionsAll: value.mentionsAll === true,
+    replyAllowed: value.replyAllowed === true,
+    mediaType,
+    media,
   };
   if (typeof value.pushName === "string" && value.pushName.length > 0) message.pushName = value.pushName;
   return message;
 }
 
-function isOwnerGroupMention(message) {
+function isOwnerGroupRequest(message) {
   return message.fromMe === false &&
-    message.groupAllowed === true &&
-    message.mentionsBot === true &&
+    message.replyAllowed === true &&
     isWhatsAppGroupId(message.chatId) &&
     isWhatsAppDirectId(message.senderId);
 }
 
 function subscriptionMatchesMessage(subscription, message) {
   return subscription.arguments.chatIds?.includes(message.chatId) === true ||
-    (subscription.arguments.ownerGroups === true && isOwnerGroupMention(message));
+    (subscription.arguments.ownerGroups === true && isOwnerGroupRequest(message));
 }
 
 function isWhatsAppGroupId(value) {
@@ -689,7 +718,7 @@ async function resolvePublicDestination(value, lookup) {
   return { ...normalized[0], hostname };
 }
 
-function isPublicIp(address) {
+export function isPublicIp(address) {
   const family = net.isIP(address);
   if (family === 4) return isPublicIpv4(address);
   if (family !== 6) return false;

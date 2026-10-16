@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { constants } from 'node:fs'
 import { chmod, mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
@@ -11,6 +11,10 @@ const GROUP_JID = /^[1-9]\d{4,19}(?:-[1-9]\d{4,19})?@g\.us$/
 const LID_JID = /^[1-9]\d{4,19}@lid$/
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const MAX_STORED_TEXT_BYTES = 32_000
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024
+const MAX_IMAGE_BASE64_LENGTH = Math.ceil(MAX_IMAGE_BYTES / 3) * 4
+const MAX_MEDIA_BYTES = 20 * 1024 * 1024
+const MEDIA_DOWNLOAD_TIMEOUT_MS = 30_000
 const OWNER_IDENTITIES_VERSION = 1
 const MAX_OWNER_IDENTITIES = 10
 const MAX_GROUP_CACHE_ENTRIES = 100
@@ -84,11 +88,124 @@ function normalizeIdentityJid(value) {
   return match ? `${match[1]}@${match[2]}` : null
 }
 
-function extractMentionedJids(rawMessage) {
+function extractContextInfo(rawMessage) {
   const message = unwrapMessage(rawMessage)
-  const mentionedJids = message?.extendedTextMessage?.contextInfo?.mentionedJid
+  return message?.extendedTextMessage?.contextInfo
+    ?? message?.imageMessage?.contextInfo
+    ?? message?.videoMessage?.contextInfo
+    ?? message?.documentMessage?.contextInfo
+    ?? message?.audioMessage?.contextInfo
+    ?? message?.stickerMessage?.contextInfo
+    ?? null
+}
+
+function extractMentionedJids(rawMessage) {
+  const mentionedJids = extractContextInfo(rawMessage)?.mentionedJid
   if (!Array.isArray(mentionedJids)) return []
   return [...new Set(mentionedJids.map(normalizeIdentityJid).filter(Boolean))].slice(0, 32)
+}
+
+function extractNonJidMentions(rawMessage) {
+  const value = extractContextInfo(rawMessage)?.nonJidMentions
+  if (value === undefined || value === null) return null
+  return value === 0 || value === 1 ? value : 'invalid'
+}
+
+function extractReplyReference(rawMessage) {
+  const contextInfo = extractContextInfo(rawMessage)
+  const id = contextInfo?.stanzaId
+  const participant = normalizeIdentityJid(contextInfo?.participant)
+  if (typeof id !== 'string' || id.length < 1 || id.length > 256) return null
+  return { id, participant }
+}
+
+function safeDirectPath(directPath, url) {
+  let candidate = directPath
+  if (candidate === undefined || candidate === null || candidate === '') {
+    try {
+      const parsed = new URL(url)
+      if (
+        parsed.protocol !== 'https:'
+        || parsed.hostname !== 'mmg.whatsapp.net'
+        || parsed.port
+        || parsed.username
+        || parsed.password
+      ) return null
+      candidate = `${parsed.pathname}${parsed.search}`
+    } catch {
+      return null
+    }
+  }
+  if (
+    typeof candidate !== 'string'
+    || candidate.length < 2
+    || candidate.length > 4096
+    || !candidate.startsWith('/')
+    || candidate.startsWith('//')
+    || candidate.includes('\\')
+    || /[\u0000-\u001f\u007f]/.test(candidate)
+  ) return null
+  try {
+    const parsed = new URL(`https://mmg.whatsapp.net${candidate}`)
+    if (parsed.protocol !== 'https:' || parsed.hostname !== 'mmg.whatsapp.net' || parsed.port) return null
+  } catch {
+    return null
+  }
+  return candidate
+}
+
+function binaryBase64(value) {
+  if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) return null
+  if (value.byteLength !== 32) return null
+  return Buffer.from(value).toString('base64')
+}
+
+function declaredFileLength(value) {
+  let numeric
+  if (typeof value === 'number') numeric = value
+  else if (typeof value === 'bigint') numeric = Number(value)
+  else if (typeof value === 'string' && /^\d+$/.test(value)) numeric = Number(value)
+  else if (typeof value?.toNumber === 'function') numeric = value.toNumber()
+  else if (Number.isInteger(value?.low)) numeric = value.low + (value.high || 0) * 0x100000000
+  return Number.isFinite(numeric) && Number.isInteger(numeric) && numeric >= 0 ? numeric : null
+}
+
+function extractMediaDownload(rawMessage, mediaType) {
+  if (!['image', 'video', 'document'].includes(mediaType)) return null
+  const message = unwrapMessage(rawMessage)
+  const media = message?.[`${mediaType}Message`]
+  const mediaKey = binaryBase64(media?.mediaKey)
+  const directPath = safeDirectPath(media?.directPath, media?.url)
+  if (!mediaKey || !directPath) return null
+  return {
+    mediaKey,
+    directPath,
+    fileLength: declaredFileLength(media.fileLength),
+    fileSha256: binaryBase64(media.fileSha256),
+    fileEncSha256: binaryBase64(media.fileEncSha256)
+  }
+}
+
+function sanitizeFileName(value, { required = false } = {}) {
+  if (value === undefined || value === null || value === '') {
+    if (required) throw new TypeError('fileName is required')
+    return null
+  }
+  if (typeof value !== 'string') throw new TypeError('fileName must be a string')
+  const leaf = value.replace(/[\r\n]/g, '').split(/[\\/]/).pop().trim()
+  const fileName = boundedString(leaf, 255, 1024)
+  if (!fileName) {
+    if (required) throw new TypeError('fileName is required')
+    return null
+  }
+  return fileName
+}
+
+function validateMimeType(value, kind) {
+  if (typeof value !== 'string' || value.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/.test(value)) {
+    throw new TypeError('mimetype must be a valid media type')
+  }
+  if (kind === 'video' && value !== 'video/mp4') throw new TypeError('video mimetype must be video/mp4')
 }
 
 function extractContent(rawMessage) {
@@ -122,7 +239,7 @@ function extractContent(rawMessage) {
   const media = mediaValue
     ? {
         mimetype: boundedString(mediaValue.mimetype, 128, 512),
-        fileName: boundedString(mediaValue.fileName, 255, 1024)
+        fileName: typeof mediaValue.fileName === 'string' ? sanitizeFileName(mediaValue.fileName) : null
       }
     : null
 
@@ -154,6 +271,106 @@ function hashText(text) {
   return createHash('sha256').update(text).digest('hex')
 }
 
+function mediaDownloadKey(chatId, messageId) {
+  return createHash('sha256').update(chatId).update('\0').update(messageId).digest('hex')
+}
+
+function decodeImageBase64(imageBase64) {
+  if (
+    typeof imageBase64 !== 'string'
+    || imageBase64.length < 4
+    || imageBase64.length > MAX_IMAGE_BASE64_LENGTH
+    || imageBase64.length % 4 !== 0
+    || !/^[A-Za-z0-9+/]*={0,2}$/.test(imageBase64)
+  ) {
+    throw new TypeError('imageBase64 must be non-empty standard base64')
+  }
+  const padding = imageBase64.endsWith('==') ? 2 : imageBase64.endsWith('=') ? 1 : 0
+  if ((imageBase64.length / 4) * 3 - padding > MAX_IMAGE_BYTES) {
+    throw new TypeError('imageBase64 must decode to at most 5 MiB')
+  }
+  const image = Buffer.from(imageBase64, 'base64')
+  if (image.length === 0 || image.length > MAX_IMAGE_BYTES || image.toString('base64') !== imageBase64) {
+    throw new TypeError('imageBase64 must decode to at most 5 MiB')
+  }
+  return image
+}
+
+function imageMimeType(image) {
+  if (image.length >= 8 && image.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return 'image/png'
+  }
+  if (image.length >= 3 && image[0] === 0xff && image[1] === 0xd8 && image[2] === 0xff) {
+    return 'image/jpeg'
+  }
+  if (image.length >= 12 && image.toString('ascii', 0, 4) === 'RIFF' && image.toString('ascii', 8, 12) === 'WEBP') {
+    return 'image/webp'
+  }
+  throw new TypeError('imageBase64 must contain a PNG, JPEG, or WebP image')
+}
+
+function mp4BoxAt(data, offset, limit) {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset + 8 > limit) return null
+  const size32 = data.readUInt32BE(offset)
+  let headerSize = 8
+  let size
+  if (size32 === 0) {
+    size = limit - offset
+  } else if (size32 === 1) {
+    if (offset + 16 > limit) return null
+    const size64 = data.readBigUInt64BE(offset + 8)
+    if (size64 > BigInt(Number.MAX_SAFE_INTEGER)) return null
+    headerSize = 16
+    size = Number(size64)
+  } else {
+    size = size32
+  }
+  if (size < headerSize || size > limit - offset) return null
+  return {
+    type: data.toString('ascii', offset + 4, offset + 8),
+    dataStart: offset + headerSize,
+    end: offset + size
+  }
+}
+
+function mp4DurationSeconds(data) {
+  let topOffset = 0
+  while (topOffset < data.length) {
+    const topBox = mp4BoxAt(data, topOffset, data.length)
+    if (!topBox) return null
+    if (topBox.type === 'moov') {
+      let childOffset = topBox.dataStart
+      while (childOffset < topBox.end) {
+        const childBox = mp4BoxAt(data, childOffset, topBox.end)
+        if (!childBox) return null
+        if (childBox.type === 'mvhd') {
+          const version = data[childBox.dataStart]
+          let timescale
+          let duration
+          if (version === 0 && childBox.dataStart + 20 <= childBox.end) {
+            timescale = data.readUInt32BE(childBox.dataStart + 12)
+            duration = BigInt(data.readUInt32BE(childBox.dataStart + 16))
+            if (duration === 0xffffffffn) return null
+          } else if (version === 1 && childBox.dataStart + 32 <= childBox.end) {
+            timescale = data.readUInt32BE(childBox.dataStart + 20)
+            duration = data.readBigUInt64BE(childBox.dataStart + 24)
+            if (duration === 0xffffffffffffffffn) return null
+          } else {
+            return null
+          }
+          if (timescale === 0 || duration === 0n) return null
+          const seconds = (duration + BigInt(timescale) - 1n) / BigInt(timescale)
+          return seconds <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(seconds) : null
+        }
+        childOffset = childBox.end
+      }
+      return null
+    }
+    topOffset = topBox.end
+  }
+  return null
+}
+
 function newMessageId() {
   return randomBytes(16).toString('hex').toUpperCase()
 }
@@ -163,7 +380,7 @@ function credentialsArePaired(authState) {
 }
 
 function unconfiguredOwnerIdentities() {
-  return { valid: false, ownerIds: new Set(), allowOwnerGroups: false }
+  return { valid: false, ownerIds: new Set(), allowOwnerGroups: false, mentionOnlyGroupIds: new Set() }
 }
 
 async function loadOwnerIdentities(file) {
@@ -178,10 +395,10 @@ async function loadOwnerIdentities(file) {
     const keys = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
       ? Object.keys(parsed).sort()
       : []
-    const allowedKeys = new Set(['allowOwnerGroups', 'ownerIds', 'version'])
+    const allowedKeys = new Set(['allowOwnerGroups', 'mentionOnlyGroupIds', 'ownerIds', 'version'])
     if (
       keys.length < 2
-      || keys.length > 3
+      || keys.length > 4
       || keys.some((key) => !allowedKeys.has(key))
       || !keys.includes('ownerIds')
       || !keys.includes('version')
@@ -191,13 +408,20 @@ async function loadOwnerIdentities(file) {
       || parsed.ownerIds.some((ownerId) => typeof ownerId !== 'string' || !LID_JID.test(ownerId))
       || new Set(parsed.ownerIds).size !== parsed.ownerIds.length
       || (parsed.allowOwnerGroups !== undefined && typeof parsed.allowOwnerGroups !== 'boolean')
+      || (parsed.mentionOnlyGroupIds !== undefined && (
+        !Array.isArray(parsed.mentionOnlyGroupIds)
+        || parsed.mentionOnlyGroupIds.length > 10
+        || parsed.mentionOnlyGroupIds.some((chatId) => typeof chatId !== 'string' || !GROUP_JID.test(chatId))
+        || new Set(parsed.mentionOnlyGroupIds).size !== parsed.mentionOnlyGroupIds.length
+      ))
     ) {
       return unconfiguredOwnerIdentities()
     }
     return {
       valid: true,
       ownerIds: new Set(parsed.ownerIds),
-      allowOwnerGroups: parsed.allowOwnerGroups === true
+      allowOwnerGroups: parsed.allowOwnerGroups === true,
+      mentionOnlyGroupIds: new Set(parsed.mentionOnlyGroupIds ?? [])
     }
   } catch {
     return unconfiguredOwnerIdentities()
@@ -221,7 +445,7 @@ class BoundedJsonStore {
     this.maxChats = Math.min(maxMessages, 1000)
     this.maxIdempotency = Math.min(maxMessages, 2000)
     this.retentionMs = retentionDays * 24 * 60 * 60 * 1000
-    this.data = { version: STORE_VERSION, messages: [], chats: {}, idempotency: {} }
+    this.data = { version: STORE_VERSION, messages: [], chats: {}, idempotency: {}, mediaDownloads: {} }
   }
 
   async load() {
@@ -229,14 +453,41 @@ class BoundedJsonStore {
     try {
       parsed = JSON.parse(await readFile(this.file, 'utf8'))
     } catch (error) {
-      if (error?.code === 'ENOENT') return
+      if (error?.code === 'ENOENT') return false
       throw new Error('Unable to read message store', { cause: error })
     }
-    if (parsed?.version !== STORE_VERSION || !Array.isArray(parsed.messages) || typeof parsed.chats !== 'object' || typeof parsed.idempotency !== 'object') {
+    if (
+      parsed?.version !== STORE_VERSION
+      || !Array.isArray(parsed.messages)
+      || typeof parsed.chats !== 'object'
+      || typeof parsed.idempotency !== 'object'
+      || (parsed.mediaDownloads !== undefined && (
+        typeof parsed.mediaDownloads !== 'object'
+        || parsed.mediaDownloads === null
+        || Array.isArray(parsed.mediaDownloads)
+      ))
+    ) {
       throw new Error('Unsupported or malformed message store')
     }
+    let migrated = parsed.mediaDownloads === undefined
+    parsed.mediaDownloads ??= {}
+    for (const message of parsed.messages) {
+      if (!message || typeof message !== 'object' || Array.isArray(message)) continue
+      if (message._mediaDownload && typeof message._mediaDownload === 'object' && !Array.isArray(message._mediaDownload)) {
+        if (typeof message.chatId === 'string' && typeof message.id === 'string') {
+          parsed.mediaDownloads[mediaDownloadKey(message.chatId, message.id)] = message._mediaDownload
+        }
+      }
+      if (Object.hasOwn(message, '_mediaDownload')) {
+        delete message._mediaDownload
+        migrated = true
+      }
+    }
     this.data = parsed
+    const mediaKeysBeforePrune = Object.keys(this.data.mediaDownloads).sort().join('\n')
     this.prune()
+    if (Object.keys(this.data.mediaDownloads).sort().join('\n') !== mediaKeysBeforePrune) migrated = true
+    return migrated
   }
 
   prune(now = Date.now()) {
@@ -256,6 +507,10 @@ class BoundedJsonStore {
       .sort((a, b) => b.createdAt - a.createdAt)
       .slice(0, this.maxIdempotency)
     this.data.idempotency = Object.fromEntries(idempotency.map((entry) => [entry.key, entry]))
+
+    const mediaKeys = new Set(this.data.messages.map((message) => mediaDownloadKey(message.chatId, message.id)))
+    this.data.mediaDownloads = Object.fromEntries(Object.entries(this.data.mediaDownloads ?? {})
+      .filter(([key, descriptor]) => mediaKeys.has(key) && descriptor && typeof descriptor === 'object' && !Array.isArray(descriptor)))
   }
 
   async persist() {
@@ -328,6 +583,14 @@ class BoundedJsonStore {
     const message = this.data.messages.find((item) => item.id === key?.id && item.chatId === key?.remoteJid)
     return message?.text ? { conversation: message.text } : undefined
   }
+
+  getMediaDownload(chatId, messageId) {
+    return this.data.mediaDownloads[mediaDownloadKey(chatId, messageId)] ?? null
+  }
+
+  putMediaDownload(chatId, messageId, descriptor) {
+    this.data.mediaDownloads[mediaDownloadKey(chatId, messageId)] = descriptor
+  }
 }
 
 export class WhatsAppBridge extends EventEmitter {
@@ -338,6 +601,7 @@ export class WhatsAppBridge extends EventEmitter {
     retentionDays = 7,
     socketFactory,
     authStateFactory,
+    downloadContentFromMessage,
     disconnectReason,
     reconnectDelayMs = 1000,
     reconnectMaxDelayMs = 30000
@@ -357,6 +621,7 @@ export class WhatsAppBridge extends EventEmitter {
     this.retentionDays = retentionDays
     this.socketFactory = socketFactory
     this.authStateFactory = authStateFactory
+    this.downloadContentFromMessage = downloadContentFromMessage
     this.disconnectReason = disconnectReason
     this.reconnectDelayMs = reconnectDelayMs
     this.reconnectMaxDelayMs = reconnectMaxDelayMs
@@ -391,7 +656,8 @@ export class WhatsAppBridge extends EventEmitter {
       await mkdir(this.authDir, { recursive: true, mode: 0o700 })
       await chmod(this.authDir, 0o700)
       this.ownerIdentities = await loadOwnerIdentities(this.ownerIdentitiesFile)
-      await this.store.load()
+      const storeMigrated = await this.store.load()
+      if (storeMigrated) await this.store.persist()
       await this._loadDependencies()
       const auth = await this.authStateFactory(this.authDir)
       this.authState = auth.state
@@ -455,6 +721,139 @@ export class WhatsAppBridge extends EventEmitter {
       .map((message) => this._messageView(message))
   }
 
+  async getMedia({ chatId, messageId } = {}) {
+    assertChatId(chatId)
+    if (typeof messageId !== 'string' || messageId.length < 1 || messageId.length > 256) {
+      throw new TypeError('messageId is required')
+    }
+    if (!this.started || !this.downloadContentFromMessage) throw new Error('WhatsApp bridge is not started')
+    if (GROUP_JID.test(chatId)) {
+      if (!(await this._getGroupAccess(chatId, { fresh: true }))) throw new Error('Media access is not allowed')
+    } else if (!this.ownerIdentities.valid || !this.ownerIdentities.ownerIds.has(chatId)) {
+      throw new Error('Media access is not allowed')
+    }
+
+    const message = this.store.data.messages.find((item) => (
+      item.id === messageId
+      && item.chatId === chatId
+      && item.direction === 'incoming'
+      && item.fromMe === false
+      && ['image', 'video', 'document'].includes(item.mediaType)
+    ))
+    const descriptor = message && this.store.getMediaDownload(chatId, messageId)
+    if (!descriptor) throw new Error('Media is unavailable')
+    if (!GROUP_JID.test(chatId) && senderRoleForMessage(message, this.ownerIdentities.ownerIds) !== 'owner') {
+      throw new Error('Media access is not allowed')
+    }
+
+    const fileLength = declaredFileLength(descriptor.fileLength)
+    if (fileLength !== null && fileLength > MAX_MEDIA_BYTES) {
+      throw new Error('Media exceeds 20 MiB')
+    }
+    const directPath = safeDirectPath(descriptor.directPath)
+    let mediaKey
+    let expectedFileHash = null
+    try {
+      mediaKey = Buffer.from(descriptor.mediaKey, 'base64')
+      if (descriptor.fileSha256 !== null) expectedFileHash = Buffer.from(descriptor.fileSha256, 'base64')
+      if (
+        mediaKey.length !== 32
+        || mediaKey.toString('base64') !== descriptor.mediaKey
+        || !directPath
+        || (expectedFileHash && (
+          expectedFileHash.length !== 32
+          || expectedFileHash.toString('base64') !== descriptor.fileSha256
+        ))
+      ) throw new Error()
+    } catch {
+      throw new Error('Media is unavailable')
+    }
+
+    let stream
+    let timer
+    let timedOut = false
+    const controller = new AbortController()
+    const timeout = new Promise((resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true
+        controller.abort()
+        stream?.destroy?.()
+        reject(new Error('Media download timed out'))
+      }, MEDIA_DOWNLOAD_TIMEOUT_MS)
+    })
+    const download = async () => {
+      stream = await this.downloadContentFromMessage(
+        { mediaKey, directPath },
+        message.mediaType,
+        { options: { timeout: MEDIA_DOWNLOAD_TIMEOUT_MS, maxRedirects: 0, signal: controller.signal } }
+      )
+      if (timedOut) {
+        stream?.destroy?.()
+        throw new Error('Media download timed out')
+      }
+      if (!stream || typeof stream[Symbol.asyncIterator] !== 'function') throw new Error('Invalid media stream')
+      const chunks = []
+      let length = 0
+      const hash = expectedFileHash ? createHash('sha256') : null
+      for await (const value of stream) {
+        if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) throw new Error('Invalid media stream')
+        const chunk = Buffer.from(value)
+        if (chunk.length === 0) continue
+        length += chunk.length
+        if (length > MAX_MEDIA_BYTES) {
+          stream.destroy?.()
+          throw new Error('Media exceeds 20 MiB')
+        }
+        hash?.update(chunk)
+        chunks.push(chunk)
+      }
+      if (fileLength !== null && length !== fileLength) {
+        throw new Error('Media length did not match descriptor')
+      }
+      if (expectedFileHash && !timingSafeEqual(hash.digest(), expectedFileHash)) {
+        throw new Error('Media hash did not match descriptor')
+      }
+      return Buffer.concat(chunks, length)
+    }
+
+    let data
+    try {
+      data = await Promise.race([download(), timeout])
+    } catch (error) {
+      if (error?.message === 'Media exceeds 20 MiB' || error?.message === 'Media download timed out') throw error
+      throw new Error('Unable to download media')
+    } finally {
+      clearTimeout(timer)
+    }
+    return {
+      data,
+      mimetype: message.media?.mimetype ?? null,
+      fileName: message.media?.fileName ?? null,
+      mediaType: message.mediaType
+    }
+  }
+
+  async getGroupInfo({ chatId } = {}) {
+    if (typeof chatId !== 'string' || !GROUP_JID.test(chatId)) throw new TypeError('chatId must be a WhatsApp group JID')
+    if (!this.started || !this.socket) throw new Error('WhatsApp bridge is not started')
+    try {
+      const metadata = await this.socket.groupMetadata(chatId)
+      if (!(await this._groupMetadataAllowsAccess(chatId, metadata))) throw new Error()
+      this._cacheGroupAccess(chatId, true)
+      return {
+        chatId,
+        subject: boundedString(metadata.subject, 256, 1024),
+        description: boundedString(metadata.desc, 8000, MAX_STORED_TEXT_BYTES),
+        announcementOnly: metadata.announce === true,
+        ownerPresent: true,
+        botPresent: true
+      }
+    } catch {
+      this.groupMetadataCache.delete(chatId)
+      throw new Error('Group access is not allowed')
+    }
+  }
+
   async getPendingReplies({ scope, after, limit = 20 } = {}) {
     if (scope !== 'groups') throw new TypeError('scope must be groups')
     if (!Number.isSafeInteger(after) || after < 1) throw new TypeError('after must be a positive epoch millisecond integer')
@@ -468,7 +867,12 @@ export class WhatsAppBridge extends EventEmitter {
       .sort((a, b) => a.timestamp - b.timestamp)
       .filter((message) => {
         const view = this._messageView(message, { groupAllowed: false })
-        return view.mentionsBot && !view.autoReplySent && typeof view.text === 'string' && view.text.length > 0
+        return this._groupMessageAddressesBot(message.chatId, message)
+          && !view.autoReplySent
+          && (
+            (typeof view.text === 'string' && view.text.length > 0)
+            || (['image', 'video', 'document'].includes(view.mediaType) && view.media !== null)
+          )
       })
     const accessByChat = new Map()
     const pending = []
@@ -477,7 +881,7 @@ export class WhatsAppBridge extends EventEmitter {
         accessByChat.set(message.chatId, await this._getGroupAccess(message.chatId, { fresh: true }))
       }
       const view = this._messageView(message, { groupAllowed: accessByChat.get(message.chatId) })
-      if (view.groupAllowed) {
+      if (view.replyAllowed) {
         pending.push(view)
         if (pending.length >= parsedLimit) break
       }
@@ -499,13 +903,80 @@ export class WhatsAppBridge extends EventEmitter {
     return operation
   }
 
+  async sendImage({ chatId, imageBase64, caption = '', idempotencyKey } = {}) {
+    assertChatId(chatId)
+    if (typeof caption !== 'string' || caption.length > 2000) {
+      throw new TypeError('caption must contain at most 2000 characters')
+    }
+    if (typeof idempotencyKey !== 'string' || !IDEMPOTENCY_KEY.test(idempotencyKey)) {
+      throw new TypeError('idempotencyKey must contain 1-128 safe characters')
+    }
+    const image = decodeImageBase64(imageBase64)
+    const mimetype = imageMimeType(image)
+
+    const operation = this.sendQueue.then(() => this._sendImageLocked({
+      chatId,
+      image,
+      mimetype,
+      caption,
+      idempotencyKey
+    }))
+    this.sendQueue = operation.catch(() => {})
+    return operation
+  }
+
+  async sendMedia({ chatId, kind, data, mimetype, fileName, caption = '', idempotencyKey } = {}) {
+    assertChatId(chatId)
+    if (kind !== 'video' && kind !== 'document') throw new TypeError('kind must be video or document')
+    if (!Buffer.isBuffer(data) || data.length < 1 || data.length > MAX_MEDIA_BYTES) {
+      throw new TypeError('data must be a non-empty Buffer of at most 20 MiB')
+    }
+    validateMimeType(mimetype, kind)
+    const safeFileName = sanitizeFileName(fileName, { required: kind === 'document' })
+    if (typeof caption !== 'string' || caption.length > 2000) {
+      throw new TypeError('caption must contain at most 2000 characters')
+    }
+    if (typeof idempotencyKey !== 'string' || !IDEMPOTENCY_KEY.test(idempotencyKey)) {
+      throw new TypeError('idempotencyKey must contain 1-128 safe characters')
+    }
+    const media = Buffer.from(data)
+    if (kind === 'video' && (media.length < 12 || media.toString('ascii', 4, 8) !== 'ftyp')) {
+      throw new TypeError('video data must contain an MP4 ftyp header')
+    }
+    const requestHash = createHash('sha256')
+      .update(kind).update('\0')
+      .update(mimetype).update('\0')
+      .update(safeFileName ?? '').update('\0')
+      .update(caption).update('\0')
+      .update(media)
+      .digest('hex')
+
+    const operation = this.sendQueue.then(() => this._sendMediaLocked({
+      chatId,
+      kind,
+      media,
+      mimetype,
+      fileName: safeFileName,
+      caption,
+      idempotencyKey,
+      requestHash
+    }))
+    this.sendQueue = operation.catch(() => {})
+    return operation
+  }
+
   async _sendTextLocked({ chatId, text, idempotencyKey }) {
     if (!this.started || this.status !== 'connected' || !this.socket) {
       throw new Error('WhatsApp is not connected')
     }
+    this._validateGroupSendPolicy(chatId, idempotencyKey)
     const textHash = hashText(text)
     let entry = this.store.data.idempotency[idempotencyKey]
-    if (entry && (entry.chatId !== chatId || entry.textHash !== textHash)) {
+    if (entry && (
+      entry.chatId !== chatId
+      || (entry.requestType !== undefined && entry.requestType !== 'text')
+      || entry.textHash !== textHash
+    )) {
       throw new Error('idempotencyKey was already used with a different request')
     }
     const isAutomaticReply = idempotencyKey.startsWith('dot-auto:')
@@ -517,6 +988,7 @@ export class WhatsAppBridge extends EventEmitter {
       entry = {
         key: idempotencyKey,
         chatId,
+        requestType: 'text',
         textHash,
         messageId: newMessageId(),
         status: 'pending',
@@ -546,24 +1018,184 @@ export class WhatsAppBridge extends EventEmitter {
     return entry.messageId
   }
 
+  async _sendImageLocked({ chatId, image, mimetype, caption, idempotencyKey }) {
+    if (!this.started || this.status !== 'connected' || !this.socket) {
+      throw new Error('WhatsApp is not connected')
+    }
+    this._validateGroupSendPolicy(chatId, idempotencyKey)
+    const imageHash = hashText(image)
+    const captionHash = hashText(caption)
+    let entry = this.store.data.idempotency[idempotencyKey]
+    if (entry && (
+      entry.chatId !== chatId
+      || entry.requestType !== 'image'
+      || entry.imageHash !== imageHash
+      || entry.captionHash !== captionHash
+      || entry.mimetype !== mimetype
+    )) {
+      throw new Error('idempotencyKey was already used with a different request')
+    }
+    const isAutomaticReply = idempotencyKey.startsWith('dot-auto:')
+    if (isAutomaticReply) await this._validateAutomaticReply(chatId, idempotencyKey, false)
+    if (entry?.status === 'sent') return entry.messageId
+    if (isAutomaticReply) await this._validateAutomaticReply(chatId, idempotencyKey, true)
+
+    if (!entry) {
+      entry = {
+        key: idempotencyKey,
+        chatId,
+        requestType: 'image',
+        imageHash,
+        captionHash,
+        mimetype,
+        size: image.length,
+        messageId: newMessageId(),
+        status: 'pending',
+        createdAt: Date.now()
+      }
+      await this._mutateStore(() => {
+        this.store.data.idempotency[idempotencyKey] = entry
+      })
+    }
+
+    const sent = await this.socket.sendMessage(chatId, { image, mimetype, caption }, { messageId: entry.messageId })
+    await this._mutateStore(() => {
+      entry.messageId = sent?.key?.id || entry.messageId
+      entry.status = 'sent'
+      entry.sentAt = Date.now()
+      this.store.putMessage({
+        id: entry.messageId,
+        chatId,
+        senderId: this.account?.id ?? null,
+        direction: 'outgoing',
+        timestamp: entry.sentAt,
+        text: caption || null,
+        mediaType: 'image',
+        media: { mimetype, size: image.length }
+      }, null)
+    })
+    return entry.messageId
+  }
+
+  async _sendMediaLocked({ chatId, kind, media, mimetype, fileName, caption, idempotencyKey, requestHash }) {
+    if (!this.started || this.status !== 'connected' || !this.socket) {
+      throw new Error('WhatsApp is not connected')
+    }
+    this._validateGroupSendPolicy(chatId, idempotencyKey)
+    let entry = this.store.data.idempotency[idempotencyKey]
+    if (entry && (
+      entry.chatId !== chatId
+      || entry.requestType !== 'media'
+      || entry.requestHash !== requestHash
+    )) {
+      throw new Error('idempotencyKey was already used with a different request')
+    }
+    const isAutomaticReply = idempotencyKey.startsWith('dot-auto:')
+    if (isAutomaticReply) await this._validateAutomaticReply(chatId, idempotencyKey, false)
+    if (entry?.status === 'sent') return entry.messageId
+    if (isAutomaticReply) await this._validateAutomaticReply(chatId, idempotencyKey, true)
+
+    if (!entry) {
+      entry = {
+        key: idempotencyKey,
+        chatId,
+        requestType: 'media',
+        requestHash,
+        kind,
+        mimetype,
+        fileName,
+        size: media.length,
+        messageId: newMessageId(),
+        status: 'pending',
+        createdAt: Date.now()
+      }
+      await this._mutateStore(() => {
+        this.store.data.idempotency[idempotencyKey] = entry
+      })
+    }
+
+    const seconds = kind === 'video' ? mp4DurationSeconds(media) : null
+    const content = kind === 'video'
+      ? { video: media, mimetype, caption, ...(seconds === null ? {} : { seconds }) }
+      : { document: media, mimetype, fileName, caption }
+    const sent = await this.socket.sendMessage(chatId, content, { messageId: entry.messageId })
+    await this._mutateStore(() => {
+      entry.messageId = sent?.key?.id || entry.messageId
+      entry.status = 'sent'
+      entry.sentAt = Date.now()
+      this.store.putMessage({
+        id: entry.messageId,
+        chatId,
+        senderId: this.account?.id ?? null,
+        direction: 'outgoing',
+        timestamp: entry.sentAt,
+        text: caption || null,
+        mediaType: kind,
+        media: { mimetype, fileName, size: media.length }
+      }, null)
+    })
+    return entry.messageId
+  }
+
   _messageView(message, { groupAllowed } = {}) {
     const {
+      _mediaDownload,
       _mentionedJids,
+      _nonJidMentions,
+      _replyTo,
       autoReplySent: ignoredAutoReplySent,
       groupAllowed: ignoredGroupAllowed,
+      mentionsAll: ignoredMentionsAll,
       mentionsBot: ignoredMentionsBot,
+      replyAllowed: ignoredReplyAllowed,
+      repliesToBot: ignoredRepliesToBot,
       senderRole: ignoredSenderRole,
       ...publicMessage
     } = message
     const autoReply = this.store.data.idempotency[`dot-auto:${message.id}`]
     const isGroup = GROUP_JID.test(message.chatId)
+    const senderRole = senderRoleForMessage(message, this.ownerIdentities.ownerIds)
+    const mentionsBot = isGroup && this._mentionedJidsIncludeBot(_mentionedJids)
+    const mentionsAll = isGroup && _nonJidMentions === 1
+    const replyAddressed = isGroup && this._groupMessageAddressesBot(message.chatId, message)
+    const allowedGroup = isGroup && (groupAllowed ?? this._cachedGroupAllowed(message.chatId) ?? false)
+    const incoming = message.direction === 'incoming' && message.fromMe === false
     return {
       ...publicMessage,
-      senderRole: senderRoleForMessage(message, this.ownerIdentities.ownerIds),
+      senderRole,
       autoReplySent: autoReply?.status === 'sent' && autoReply.chatId === message.chatId,
-      groupAllowed: isGroup && (groupAllowed ?? this._cachedGroupAllowed(message.chatId) ?? false),
-      mentionsBot: isGroup && this._mentionedJidsIncludeBot(_mentionedJids)
+      groupAllowed: allowedGroup,
+      mentionsBot,
+      mentionsAll,
+      repliesToBot: isGroup && this._replyReferenceIsBotMessage(message.chatId, _replyTo),
+      quotedMessageId: _replyTo?.id ?? null,
+      replyAllowed: incoming && (isGroup ? allowedGroup && replyAddressed : senderRole === 'owner')
     }
+  }
+
+  _groupMessageAddressesBot(chatId, message) {
+    if (message._nonJidMentions === 1 || message._nonJidMentions === 'invalid') return false
+    if (this.ownerIdentities.mentionOnlyGroupIds.has(chatId)) {
+      return this._mentionedJidsIncludeBot(message._mentionedJids)
+    }
+    return this._mentionedJidsIncludeBot(message._mentionedJids)
+      || this._replyReferenceIsBotMessage(chatId, message._replyTo)
+  }
+
+  _validateGroupSendPolicy(chatId, idempotencyKey) {
+    if (this.ownerIdentities.mentionOnlyGroupIds.has(chatId) && !idempotencyKey.startsWith('dot-auto:')) {
+      throw new Error('This group only allows verified automatic replies')
+    }
+  }
+
+  _replyReferenceIsBotMessage(chatId, replyTo) {
+    if (!replyTo || !this.botIdentityIds.has(replyTo.participant)) return false
+    return this.store.data.messages.some((message) => (
+      message.id === replyTo.id
+      && message.chatId === chatId
+      && message.direction === 'outgoing'
+      && this.botIdentityIds.has(normalizeIdentityJid(message.senderId))
+    ))
   }
 
   _mentionedJidsIncludeBot(mentionedJids) {
@@ -624,27 +1256,32 @@ export class WhatsAppBridge extends EventEmitter {
     if (!fresh && cached !== null) return cached
     try {
       const metadata = await this.socket?.groupMetadata?.(chatId)
-      if (metadata?.id !== chatId || !Array.isArray(metadata.participants)) throw new Error('Invalid group metadata')
-      this._refreshBotIdentitySeeds()
-      const ownerIds = await this._identityAliases(this.ownerIdentities.ownerIds)
-      this.botIdentityIds = await this._identityAliases(this.botIdentityIds)
-      let ownerPresent = false
-      let botPresent = false
-      for (const participant of metadata.participants) {
-        if (!participant || typeof participant !== 'object' || Array.isArray(participant)) continue
-        const identities = [participant.id, participant.lid, participant.phoneNumber]
-          .map(normalizeIdentityJid)
-          .filter(Boolean)
-        if (identities.some((identity) => ownerIds.has(identity))) ownerPresent = true
-        if (identities.some((identity) => this.botIdentityIds.has(identity))) botPresent = true
-      }
-      const allowed = ownerPresent && botPresent
+      const allowed = await this._groupMetadataAllowsAccess(chatId, metadata)
       this._cacheGroupAccess(chatId, allowed)
       return allowed
     } catch {
       this.groupMetadataCache.delete(chatId)
       return false
     }
+  }
+
+  async _groupMetadataAllowsAccess(chatId, metadata) {
+    if (!this.ownerIdentities.valid || !this.ownerIdentities.allowOwnerGroups) return false
+    if (metadata?.id !== chatId || !Array.isArray(metadata.participants)) return false
+    this._refreshBotIdentitySeeds()
+    const ownerIds = await this._identityAliases(this.ownerIdentities.ownerIds)
+    this.botIdentityIds = await this._identityAliases(this.botIdentityIds)
+    let ownerPresent = false
+    let botPresent = false
+    for (const participant of metadata.participants) {
+      if (!participant || typeof participant !== 'object' || Array.isArray(participant)) continue
+      const identities = [participant.id, participant.lid, participant.phoneNumber]
+        .map(normalizeIdentityJid)
+        .filter(Boolean)
+      if (identities.some((identity) => ownerIds.has(identity))) ownerPresent = true
+      if (identities.some((identity) => this.botIdentityIds.has(identity))) botPresent = true
+    }
+    return ownerPresent && botPresent
   }
 
   async _validateAutomaticReply(chatId, idempotencyKey, requireFreshGroup) {
@@ -665,8 +1302,9 @@ export class WhatsAppBridge extends EventEmitter {
 
     this._refreshBotIdentitySeeds()
     this.botIdentityIds = await this._identityAliases(this.botIdentityIds)
-    if (!this.ownerIdentities.valid || !this.ownerIdentities.allowOwnerGroups || !this._mentionedJidsIncludeBot(source._mentionedJids)) {
-      throw new Error('dot-auto source is not an allowed group mention')
+    const addressesBot = this._groupMessageAddressesBot(chatId, source)
+    if (!this.ownerIdentities.valid || !this.ownerIdentities.allowOwnerGroups || !addressesBot) {
+      throw new Error('dot-auto source is not an allowed group mention or reply')
     }
     if (requireFreshGroup && !(await this._getGroupAccess(chatId, { fresh: true }))) {
       throw new Error('dot-auto group is not currently allowed')
@@ -674,10 +1312,17 @@ export class WhatsAppBridge extends EventEmitter {
   }
 
   async _loadDependencies() {
-    if (!this.socketFactory || !this.authStateFactory || !this.disconnectReason) {
+    if (!this.socketFactory || !this.authStateFactory || !this.downloadContentFromMessage || !this.disconnectReason) {
       const baileys = await import('@whiskeysockets/baileys')
       this.socketFactory ??= baileys.default
       this.authStateFactory ??= baileys.useMultiFileAuthState
+      if (!this.downloadContentFromMessage) {
+        const { downloadWhatsAppMedia } = await import('./media.mjs')
+        this.downloadContentFromMessage = (descriptor, kind, options) => downloadWhatsAppMedia(descriptor, kind, {
+          getMediaKeys: baileys.getMediaKeys,
+          signal: options?.options?.signal
+        })
+      }
       this.disconnectReason ??= baileys.DisconnectReason
     }
     if (!this.logger) {
@@ -802,6 +1447,9 @@ export class WhatsAppBridge extends EventEmitter {
 
       const isGroup = GROUP_JID.test(chatId)
       const mentionedJids = isGroup ? extractMentionedJids(raw.message) : []
+      const nonJidMentions = isGroup ? extractNonJidMentions(raw.message) : null
+      const replyTo = isGroup ? extractReplyReference(raw.message) : null
+      const mediaDownload = extractMediaDownload(raw.message, content.mediaType)
       if (isGroup) {
         this._refreshBotIdentitySeeds()
         this.botIdentityIds = await this._identityAliases(this.botIdentityIds)
@@ -821,10 +1469,16 @@ export class WhatsAppBridge extends EventEmitter {
         text: content.text,
         mediaType: content.mediaType,
         media: content.media,
-        _mentionedJids: mentionedJids
+        _mentionedJids: mentionedJids,
+        _nonJidMentions: nonJidMentions,
+        _replyTo: replyTo
       }
       normalized.senderRole = senderRoleForMessage(normalized, this.ownerIdentities.ownerIds)
-      const isNew = await this._mutateStore(() => this.store.putMessage(normalized, normalized.pushName))
+      const isNew = await this._mutateStore(() => {
+        const inserted = this.store.putMessage(normalized, normalized.pushName)
+        if (mediaDownload) this.store.putMediaDownload(normalized.chatId, normalized.id, mediaDownload)
+        return inserted
+      })
       if (!isNew) continue
       const { autoReplySent, ...eventMessage } = this._messageView(normalized, { groupAllowed })
       this.emit('message', {

@@ -96,6 +96,11 @@ test("lists one webhook event with a required exact-chat allowlist", async () =>
     assert.equal(result.events[0].payloadSchema.required.includes("senderRole"), true);
     assert.equal(result.events[0].payloadSchema.required.includes("groupAllowed"), true);
     assert.equal(result.events[0].payloadSchema.required.includes("mentionsBot"), true);
+    assert.equal(result.events[0].payloadSchema.required.includes("repliesToBot"), true);
+    assert.equal(result.events[0].payloadSchema.required.includes("mentionsAll"), true);
+    assert.equal(result.events[0].payloadSchema.required.includes("replyAllowed"), true);
+    assert.equal(result.events[0].payloadSchema.required.includes("mediaType"), true);
+    assert.equal(result.events[0].payloadSchema.required.includes("media"), true);
   } finally {
     await context.cleanup();
   }
@@ -271,9 +276,13 @@ test("isolates chat filters and filters own, status and history messages before 
     await waitUntil(() => deliveries.length === 1);
     assert.equal(deliveries[0].subscriptionId, a.id);
     assert.equal(deliveries[0].body.data.chatId, CHAT_A);
-    assert.equal("media" in deliveries[0].body.data, false);
+    assert.equal(deliveries[0].body.data.mediaType, null);
+    assert.equal(deliveries[0].body.data.media, null);
     assert.equal(deliveries[0].body.data.groupAllowed, false);
     assert.equal(deliveries[0].body.data.mentionsBot, false);
+    assert.equal(deliveries[0].body.data.repliesToBot, false);
+    assert.equal(deliveries[0].body.data.mentionsAll, false);
+    assert.equal(deliveries[0].body.data.replyAllowed, false);
     assert.deepEqual(await context.manager.publish(message({ id: "own", fromMe: true })), { queued: 0, dropped: 0, filtered: true });
     assert.deepEqual(await context.manager.publish(message({ id: "history", type: "history" })), { queued: 0, dropped: 0, filtered: true });
     assert.deepEqual(await context.manager.publish(message({ id: "status", chatId: "status@broadcast" })), { queued: 0, dropped: 0, filtered: true });
@@ -303,7 +312,7 @@ test("requires an explicit event scope", async () => {
   }
 });
 
-test("restores owner-group subscriptions and matches only trusted explicit group mentions", async () => {
+test("restores owner-group subscriptions and matches only trusted mentions or bot replies", async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-events-owner-groups-"));
   const first = new EventSubscriptions({
     dataDir,
@@ -335,6 +344,17 @@ test("restores owner-group subscriptions and matches only trusted explicit group
       senderRole: "untrusted",
       groupAllowed: true,
       mentionsBot: true,
+      replyAllowed: true,
+    })), { queued: 1, dropped: 0 });
+    assert.deepEqual(await second.publish(message({
+      id: "allowed-reply",
+      chatId: CHAT_B,
+      senderId: OWNER_LID,
+      senderRole: "untrusted",
+      groupAllowed: true,
+      mentionsBot: false,
+      repliesToBot: true,
+      replyAllowed: true,
     })), { queued: 1, dropped: 0 });
     assert.deepEqual(await second.publish(message({
       id: "group-not-allowed",
@@ -342,6 +362,7 @@ test("restores owner-group subscriptions and matches only trusted explicit group
       senderId: OWNER_LID,
       groupAllowed: false,
       mentionsBot: true,
+      replyAllowed: false,
     })), { queued: 0, dropped: 0 });
     assert.deepEqual(await second.publish(message({
       id: "bot-not-mentioned",
@@ -349,6 +370,17 @@ test("restores owner-group subscriptions and matches only trusted explicit group
       senderId: OWNER_LID,
       groupAllowed: true,
       mentionsBot: false,
+      repliesToBot: false,
+      replyAllowed: false,
+    })), { queued: 0, dropped: 0 });
+    assert.deepEqual(await second.publish(message({
+      id: "mention-all-not-allowed",
+      chatId: CHAT_B,
+      senderId: OWNER_LID,
+      groupAllowed: true,
+      mentionsBot: true,
+      mentionsAll: true,
+      replyAllowed: false,
     })), { queued: 0, dropped: 0 });
     assert.deepEqual(await second.publish(message({
       id: "missing-participant",
@@ -356,6 +388,7 @@ test("restores owner-group subscriptions and matches only trusted explicit group
       senderId: null,
       groupAllowed: true,
       mentionsBot: true,
+      replyAllowed: true,
     })), { queued: 0, dropped: 0 });
     assert.deepEqual(await second.publish(message({
       id: "private-cannot-use-group-scope",
@@ -363,12 +396,19 @@ test("restores owner-group subscriptions and matches only trusted explicit group
       senderId: OWNER_LID,
       groupAllowed: true,
       mentionsBot: true,
+      replyAllowed: true,
     })), { queued: 0, dropped: 0 });
-    await waitUntil(() => deliveries.length === 1);
+    await waitUntil(() => deliveries.length === 2);
+    assert.deepEqual(deliveries.map(({ data }) => data.id), ["allowed-mention", "allowed-reply"]);
     assert.equal(deliveries[0].data.chatId, CHAT_B);
     assert.equal(deliveries[0].data.senderRole, "untrusted");
     assert.equal(deliveries[0].data.groupAllowed, true);
     assert.equal(deliveries[0].data.mentionsBot, true);
+    assert.equal(deliveries[0].data.repliesToBot, false);
+    assert.equal(deliveries[0].data.replyAllowed, true);
+    assert.equal(deliveries[1].data.mentionsBot, false);
+    assert.equal(deliveries[1].data.repliesToBot, true);
+    assert.equal(deliveries[1].data.replyAllowed, true);
   } finally {
     await second.stop().catch(() => {});
     await fs.rm(dataDir, { recursive: true, force: true });
@@ -401,10 +441,10 @@ test("normalizes the bridge's millisecond and media-only message shape", async (
     }));
     await waitUntil(() => delivered !== undefined);
     assert.equal(delivered.data.timestamp, "2027-01-15T08:00:00.123Z");
-    assert.equal(delivered.data.text, "");
+    assert.equal(delivered.data.text, null);
     assert.equal(delivered.data.senderId, legacyGroup);
-    assert.equal("mediaType" in delivered.data, false);
-    assert.equal("media" in delivered.data, false);
+    assert.equal(delivered.data.mediaType, "image");
+    assert.deepEqual(delivered.data.media, { mimetype: "image/jpeg", fileName: null });
   } finally {
     await context.cleanup();
   }
@@ -479,6 +519,8 @@ test("persists a pending queue across restart, retries with one event ID and fre
   delete legacyState.queue[0].event.data.senderRole;
   delete legacyState.queue[0].event.data.groupAllowed;
   delete legacyState.queue[0].event.data.mentionsBot;
+  legacyState.queue[0].event.data.repliesToBot = "true";
+  legacyState.queue[0].event.data.replyAllowed = "true";
   await fs.writeFile(statePath, `${JSON.stringify(legacyState)}\n`);
 
   const attempts = [];
@@ -506,6 +548,8 @@ test("persists a pending queue across restart, retries with one event ID and fre
     assert.equal(restored.data.senderRole, "untrusted");
     assert.equal(restored.data.groupAllowed, false);
     assert.equal(restored.data.mentionsBot, false);
+    assert.equal(restored.data.repliesToBot, false);
+    assert.equal(restored.data.replyAllowed, false);
     assert.equal(second.stats().failedDeliveries, 0);
     const stateMode = (await fs.stat(statePath)).mode & 0o777;
     const directoryMode = (await fs.stat(dataDir)).mode & 0o777;
@@ -517,7 +561,7 @@ test("persists a pending queue across restart, retries with one event ID and fre
   }
 });
 
-test("restores one trusted group delivery and keeps its upstream duplicate suppressed", async () => {
+test("restores one trusted group reply delivery and keeps its upstream duplicate suppressed", async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-events-group-restart-"));
   const incoming = message({
     id: "group-restart",
@@ -525,7 +569,9 @@ test("restores one trusted group delivery and keeps its upstream duplicate suppr
     senderId: OWNER_LID,
     senderRole: "owner",
     groupAllowed: true,
-    mentionsBot: true,
+    mentionsBot: false,
+    repliesToBot: true,
+    replyAllowed: true,
   });
   const first = new EventSubscriptions({
     dataDir,
@@ -552,7 +598,9 @@ test("restores one trusted group delivery and keeps its upstream duplicate suppr
     await second.start();
     await waitUntil(() => deliveries.length === 1);
     assert.equal(deliveries[0].data.groupAllowed, true);
-    assert.equal(deliveries[0].data.mentionsBot, true);
+    assert.equal(deliveries[0].data.mentionsBot, false);
+    assert.equal(deliveries[0].data.repliesToBot, true);
+    assert.equal(deliveries[0].data.replyAllowed, true);
     assert.equal(deliveries[0].data.senderRole, "untrusted");
     assert.deepEqual(await second.publish(incoming), { queued: 0, dropped: 0, duplicate: true });
     await new Promise((resolve) => setTimeout(resolve, 20));
