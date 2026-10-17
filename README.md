@@ -1,6 +1,10 @@
-# Baileys → MCP Events → ChatGPT Dot
+# Dot Social Bridge
 
 [English](README.md) | [繁體中文](README.zh-Hant.md) | [日本語](README.ja.md)
+
+Guides and reference implementations for connecting ChatGPT Dot to messaging and social platforms.
+
+## Current reference implementation: WhatsApp via Baileys
 
 Connect a WhatsApp account through [Baileys](https://github.com/WhiskeySockets/Baileys) to an OAuth-protected MCP server, then let ChatGPT Dot receive and reply to new messages through native MCP Events.
 
@@ -147,7 +151,7 @@ export RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 export RELEASE_DIR="$APP_ROOT/releases/$RELEASE_ID"
 export PATH="$APP_ROOT/runtime/node/bin:$PATH"
 
-git clone --depth 1 https://github.com/miku2339/baileys-dot-bridge.git "$RELEASE_DIR"
+git clone --depth 1 https://github.com/miku2339/dot-social-bridge.git "$RELEASE_DIR"
 cd "$RELEASE_DIR"
 npm ci
 npm test
